@@ -6,7 +6,6 @@ interface ConversationItem {
 interface SidebarProps {
   conversations: ConversationItem[]
   activeId: string
-  backendStatus: 'not-checked' | 'connected' | 'error'
   onNewChat: () => void
   onSelectConversation: (id: string) => void
   onStorageReview: () => void
@@ -16,7 +15,6 @@ interface SidebarProps {
 function Sidebar({
   conversations,
   activeId,
-  backendStatus,
   onNewChat,
   onSelectConversation,
   onStorageReview,
@@ -57,16 +55,6 @@ function Sidebar({
         )}
       </nav>
       <div className="sidebar-bottom">
-        <div className={`connection-indicator connection-${backendStatus}`}>
-          <i />
-          <span>
-            {backendStatus === 'connected'
-              ? 'Backend connected'
-              : backendStatus === 'error'
-                ? 'Backend unavailable'
-                : 'Backend not checked'}
-          </span>
-        </div>
         <button className="sidebar-link settings-link" onClick={onSettings}>
           <span className="sidebar-icon">⚙</span> Settings
         </button>

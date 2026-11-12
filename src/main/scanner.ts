@@ -111,8 +111,17 @@ function getCacheRoots(): CacheRoot[] {
 }
 
 export async function scanComputer(
-  onProgress: (progress: ScanProgress) => void = () => {}
+  onProgress: (progress: ScanProgress) => void = () => {},
+  signal?: AbortSignal
 ): Promise<ScanResult> {
+  const throwIfAborted = (): void => {
+    if (signal?.aborted) {
+      const error = signal.reason instanceof Error ? signal.reason : new Error('Scan cancelled.')
+      error.name ||= 'AbortError'
+      throw error
+    }
+  }
+
   scannedFiles.clear()
   const candidates: CleanupCandidate[] = []
   const roots = getCacheRoots()
@@ -127,6 +136,7 @@ export async function scanComputer(
   }
 
   async function scanDirectory(root: CacheRoot, currentPath: string, depth: number): Promise<void> {
+    throwIfAborted()
     if (depth > MAX_DEPTH || directoriesScanned >= MAX_DIRECTORIES) {
       truncated = true
       return
@@ -138,6 +148,7 @@ export async function scanComputer(
       if (!info.isDirectory() || info.isSymbolicLink()) return
       directory = await opendir(currentPath)
     } catch {
+      throwIfAborted()
       unavailableLocations++
       return
     }
@@ -148,6 +159,7 @@ export async function scanComputer(
 
     try {
       for await (const entry of directory) {
+        throwIfAborted()
         entriesScanned++
         if (entriesScanned > MAX_ENTRIES || candidates.length >= MAX_FILES) {
           truncated = true
@@ -217,16 +229,19 @@ export async function scanComputer(
           })
           reportProgress()
         } catch {
+          throwIfAborted()
           unavailableLocations++
         }
       }
     } catch {
+      throwIfAborted()
       unavailableLocations++
     }
   }
 
   reportProgress()
   for (const root of roots) {
+    throwIfAborted()
     if (truncated) break
     await scanDirectory(root, root.path, 0)
   }

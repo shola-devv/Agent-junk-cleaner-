@@ -1,3 +1,5 @@
+import Markdown from './Markdown'
+
 export interface ChatMessageData {
   id: string
   role: 'user' | 'assistant'
@@ -14,7 +16,9 @@ function ChatMessage({ message }: ChatMessageProps): React.JSX.Element {
   return (
     <article className={`message-row ${isUser ? 'message-user' : 'message-assistant'}`}>
       {!isUser && (
-        <div className="assistant-avatar" aria-hidden="true">A</div>
+        <div className="assistant-avatar" aria-hidden="true">
+          A
+        </div>
       )}
       <div className="message-content">
         <div className="message-meta">
@@ -26,7 +30,7 @@ function ChatMessage({ message }: ChatMessageProps): React.JSX.Element {
             })}
           </time>
         </div>
-        <p>{message.text}</p>
+        {isUser ? <p>{message.text}</p> : <Markdown text={message.text} />}
       </div>
     </article>
   )

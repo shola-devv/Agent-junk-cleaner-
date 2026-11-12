@@ -31,13 +31,20 @@ const STATUS_MESSAGES: Record<ApiErrorCode, string> = {
 
 export function createApiError(
   code: ApiErrorCode,
-  options: { status?: number | null; retryable?: boolean; details?: unknown; message?: string } = {}
+  options: {
+    status?: number | null
+    retryable?: boolean
+    details?: unknown
+    message?: string
+    backendCode?: string
+  } = {}
 ): ApiClientError {
   return new ApiClientError({
     code,
     status: options.status ?? null,
     retryable: options.retryable ?? false,
     message: options.message ?? STATUS_MESSAGES[code],
+    ...(options.backendCode === undefined ? {} : { backendCode: options.backendCode }),
     ...(options.details === undefined ? {} : { details: options.details })
   })
 }
@@ -45,12 +52,14 @@ export function createApiError(
 export function errorForStatus(
   status: number,
   message?: string,
-  details?: unknown
+  details?: unknown,
+  backendCode?: string
 ): ApiClientError {
   let code: ApiErrorCode = 'HTTP_ERROR'
   if (status === 401) code = 'UNAUTHORIZED'
   else if (status === 403) code = 'FORBIDDEN'
   else if (status === 429) code = 'RATE_LIMITED'
+  else if (status === 503 && backendCode === 'AI_RATE_LIMITED') code = 'RATE_LIMITED'
   else if (status === 503) code = 'SERVICE_UNAVAILABLE'
   else if (status >= 500) code = 'SERVER_ERROR'
   else if (status === 408) code = 'REQUEST_TIMEOUT'
@@ -59,6 +68,7 @@ export function errorForStatus(
     status,
     retryable: status === 408 || status === 429 || status >= 500,
     details,
-    message
+    message,
+    backendCode
   })
 }

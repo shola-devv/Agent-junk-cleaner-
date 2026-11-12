@@ -21,6 +21,8 @@ declare global {
     completedAt: string
     outcomes: CleanupOutcome[]
   }
+  type LocalToolRequest = import('../shared/toolTypes').LocalToolRequest
+  type LocalToolResult = import('../shared/toolTypes').LocalToolResult
 
   interface SystemInfo {
     appVersion: string
@@ -40,6 +42,8 @@ declare global {
         outcomes: CleanupOutcome[]
       }>
       getCleanupHistory: () => Promise<CleanupHistoryEntry[]>
+      runLocalTool: (request: LocalToolRequest) => Promise<LocalToolResult>
+      cancelLocalTool: (requestId: string) => Promise<boolean>
       onScanProgress: (callback: (progress: ScanProgress) => void) => () => void
     }
   }

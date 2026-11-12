@@ -1,6 +1,6 @@
-import { API_BASE_URL, API_TIMEOUT_MS, isApiConfigured } from './config'
+import { getApiBaseUrl, API_TIMEOUT_MS, isApiConfigured } from './config'
 import { ApiClientError, createApiError, errorForStatus } from './errors'
-import type { HealthCheckResponse, RequestOptions } from './types'
+import type { ApiEnvelope, ApiFailureEnvelope, HealthCheckResponse, RequestOptions } from './types'
 
 async function requestJson<T>(
   method: 'GET' | 'POST',
@@ -8,7 +8,7 @@ async function requestJson<T>(
   body?: unknown,
   options: RequestOptions = {}
 ): Promise<T> {
-  if (!isApiConfigured) throw createApiError('BACKEND_UNAVAILABLE')
+  if (!isApiConfigured()) throw createApiError('BACKEND_UNAVAILABLE')
   if (options.signal?.aborted) throw createApiError('REQUEST_CANCELLED')
 
   const controller = new AbortController()
@@ -22,7 +22,7 @@ async function requestJson<T>(
   options.signal?.addEventListener('abort', abortRequest, { once: true })
 
   try {
-    const baseUrl = API_BASE_URL.endsWith('/') ? API_BASE_URL : `${API_BASE_URL}/`
+    const baseUrl = getApiBaseUrl().endsWith('/') ? getApiBaseUrl() : `${getApiBaseUrl()}/`
     const endpoint = new URL(path.replace(/^\/+/, ''), baseUrl)
     const response = await fetch(endpoint, {
       method,
@@ -44,15 +44,23 @@ async function requestJson<T>(
     }
 
     if (!response.ok) {
-      const errorPayload =
-        typeof payload === 'object' && payload !== null ? (payload as Record<string, unknown>) : {}
+      const envelope: ApiFailureEnvelope =
+        typeof payload === 'object' && payload !== null ? (payload as ApiFailureEnvelope) : {}
+      const backendError = envelope.error
       const serverMessage =
-        typeof errorPayload.message === 'string'
-          ? errorPayload.message.slice(0, 400)
-          : typeof errorPayload.error === 'string'
-            ? errorPayload.error.slice(0, 400)
-            : undefined
-      throw errorForStatus(response.status, serverMessage, errorPayload.details)
+        typeof backendError?.message === 'string' ? backendError.message.slice(0, 400) : undefined
+      const backendCode = typeof backendError?.code === 'string' ? backendError.code : undefined
+      const apiError = errorForStatus(response.status, serverMessage, backendError?.details, backendCode)
+      if (backendError?.retryable && !apiError.retryable) {
+        throw createApiError(apiError.code, {
+          status: response.status,
+          retryable: true,
+          details: backendError.details,
+          message: serverMessage,
+          backendCode
+        })
+      }
+      throw apiError
     }
 
     if (!text.trim()) {
@@ -61,6 +69,22 @@ async function requestJson<T>(
         status: response.status,
         message: 'The backend returned an empty response.'
       })
+    }
+
+    if (typeof payload === 'object' && payload !== null && 'success' in payload) {
+      const envelope = payload as ApiEnvelope<T> | ApiFailureEnvelope
+      if (envelope.success === false) {
+        const backendError = envelope.error
+      throw createApiError('HTTP_ERROR', {
+        status: response.status,
+        retryable: backendError?.retryable,
+        details: backendError?.details,
+        message: backendError?.message ?? 'The backend could not complete the request.',
+        backendCode: typeof backendError?.code === 'string' ? backendError.code : undefined
+      })
+      }
+      if (envelope.success === true && 'data' in envelope) return envelope.data
+      throw createApiError('INVALID_RESPONSE', { status: response.status })
     }
 
     return payload as T

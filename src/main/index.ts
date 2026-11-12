@@ -1,4 +1,5 @@
 import { getScannedFile, scanComputer, ScannedFileSnapshot, validateScannedFile } from './scanner'
+import { open } from 'fs/promises'
 import { app, shell, BrowserWindow, dialog, ipcMain, MessageBoxOptions } from 'electron'
 import { dirname, join } from 'path'
 import { randomUUID } from 'crypto'
@@ -6,11 +7,20 @@ import { execFile } from 'child_process'
 import { promisify } from 'util'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
+import {
+  executeRegisteredTool,
+  ToolRequestLedger,
+  TOOL_REGISTRY,
+  validateToolRequest
+} from './toolRegistry'
+import type { LocalToolResult } from '../shared/toolTypes'
 
 const execFileAsync = promisify(execFile)
 const PLAN_LIFETIME_MS = 3 * 60 * 1000
 const plans = new Map<string, CleanupPlan>()
 const cleanupHistory: CleanupHistoryEntry[] = []
+const activeToolRequests = new Map<string, AbortController>()
+const toolRequestLedger = new ToolRequestLedger()
 
 interface CleanupPlan {
   id: string
@@ -72,6 +82,146 @@ async function rejectWindowsReparsePoints(filePaths: string[]): Promise<void> {
 function addHistory(entry: CleanupHistoryEntry): void {
   cleanupHistory.unshift(entry)
   cleanupHistory.splice(100)
+}
+
+type CleanupOutcome = CleanupHistoryEntry['outcomes'][number]
+
+const DIALOG_FILE_PREVIEW = 12
+
+function describeCleanupFiles(files: ScannedFileSnapshot[]): string {
+  const totalBytes = files.reduce((total, file) => total + file.size, 0)
+  const lines = files
+    .slice(0, DIALOG_FILE_PREVIEW)
+    .map((file) => `• ${file.candidate.app} — ${file.path} (${formatFileSize(file.size)})`)
+  if (files.length > DIALOG_FILE_PREVIEW) {
+    lines.push(`• …and ${files.length - DIALOG_FILE_PREVIEW} more`)
+  }
+  return `${files.length} file${files.length === 1 ? '' : 's'} · ${formatFileSize(totalBytes)}\n${lines.join('\n')}`
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let value = bytes
+  let unit = -1
+  do {
+    value /= 1024
+    unit++
+  } while (value >= 1024 && unit < units.length - 1)
+  return `${value.toFixed(1)} ${units[unit]}`
+}
+
+/** True when another process (e.g. a running editor) holds the file open. */
+async function isFileLocked(filePath: string): Promise<boolean> {
+  let handle
+  try {
+    handle = await open(filePath, 'r+')
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    return code === 'EBUSY' || code === 'EPERM' || code === 'EACCES' || code === 'ETXTBSY'
+  }
+  await handle.close()
+  return false
+}
+
+async function confirmAndTrashFiles(
+  parent: BrowserWindow | null,
+  files: ScannedFileSnapshot[],
+  expiresAt?: number,
+  signal?: AbortSignal
+): Promise<{ cancelled: boolean; outcomes: CleanupOutcome[] }> {
+  const cancelledOutcomes = (): CleanupOutcome[] =>
+    files.map((snapshot) => ({
+      path: snapshot.path,
+      app: snapshot.candidate.app,
+      sizeBytes: snapshot.size,
+      status: 'cancelled' as const,
+      message: 'You cancelled cleanup.'
+    }))
+
+  if (signal?.aborted) {
+    return { cancelled: true, outcomes: cancelledOutcomes() }
+  }
+
+  const options: MessageBoxOptions = {
+    type: 'warning',
+    buttons: ['Cancel', 'Move to Recycle Bin'],
+    defaultId: 0,
+    cancelId: 0,
+    title: 'Approve cleanup',
+    message: `Move ${files.length} selected file${files.length === 1 ? '' : 's'} to the Recycle Bin?`,
+    detail: `${describeCleanupFiles(files)}\n\nOnly the exact files listed above will be moved. You can restore them from the Recycle Bin.`
+  }
+  const confirmation = parent
+    ? await dialog.showMessageBox(parent, options)
+    : await dialog.showMessageBox(options)
+
+  const outcomes: CleanupOutcome[] = []
+  if (confirmation.response !== 1) {
+    for (const snapshot of files) {
+      outcomes.push({
+        path: snapshot.path,
+        app: snapshot.candidate.app,
+        sizeBytes: snapshot.size,
+        status: 'cancelled',
+        message: 'User cancelled cleanup.'
+      })
+    }
+    return { cancelled: true, outcomes }
+  }
+
+  for (const snapshot of files) {
+    if (signal?.aborted) {
+      outcomes.push({
+        path: snapshot.path,
+        app: snapshot.candidate.app,
+        sizeBytes: snapshot.size,
+        status: 'cancelled',
+        message: 'You cancelled cleanup.'
+      })
+      continue
+    }
+
+    if (expiresAt !== undefined && Date.now() >= expiresAt) {
+      outcomes.push({
+        path: snapshot.path,
+        app: snapshot.candidate.app,
+        sizeBytes: snapshot.size,
+        status: 'failed',
+        message: 'The cleanup plan expired before this file could be moved.'
+      })
+      continue
+    }
+
+    try {
+      await validateScannedFile(snapshot)
+      await rejectWindowsReparsePoints(getPathAncestors(snapshot.path))
+      await validateScannedFile(snapshot)
+      await shell.trashItem(snapshot.path)
+      outcomes.push({
+        path: snapshot.path,
+        app: snapshot.candidate.app,
+        sizeBytes: snapshot.size,
+        status: 'moved',
+        message: 'Moved to the Recycle Bin.'
+      })
+    } catch (error) {
+      let message = error instanceof Error ? error.message : 'Cleanup failed.'
+      if (await isFileLocked(snapshot.path)) {
+        message = `${snapshot.candidate.app} still has this file open. Close it, then approve cleanup again.`
+      } else if (/aborted|denied|in use/i.test(message)) {
+        message = 'Windows refused to move this file to the Recycle Bin. Close the app using it and try again.'
+      }
+      outcomes.push({
+        path: snapshot.path,
+        app: snapshot.candidate.app,
+        sizeBytes: snapshot.size,
+        status: 'failed',
+        message
+      })
+    }
+  }
+  return { cancelled: false, outcomes }
 }
 
 function createWindow(): void {
@@ -166,79 +316,188 @@ ipcMain.handle('app:execute-cleanup-plan', async (event, planId: unknown) => {
   if (Date.now() >= plan.expiresAt)
     throw new Error('This cleanup plan expired. Scan and review again.')
 
-  const parent = BrowserWindow.fromWebContents(event.sender)
-  const options: MessageBoxOptions = {
-    type: 'warning',
-    buttons: ['Cancel', 'Move to Recycle Bin'],
-    defaultId: 0,
-    cancelId: 0,
-    title: 'Approve cleanup',
-    message: `Move ${plan.files.length} selected file${plan.files.length === 1 ? '' : 's'} to the Recycle Bin?`,
-    detail:
-      'Only the exact files in this reviewed plan will be moved. You can restore them from the Recycle Bin.'
-  }
-  const confirmation = parent
-    ? await dialog.showMessageBox(parent, options)
-    : await dialog.showMessageBox(options)
-
-  const entry: CleanupHistoryEntry = {
-    id: plan.id,
-    completedAt: new Date().toISOString(),
-    outcomes: []
-  }
-  if (confirmation.response !== 1) {
-    entry.outcomes = plan.files.map(({ candidate, size }) => ({
-      path: candidate.displayPath,
-      app: candidate.app,
-      sizeBytes: size,
-      status: 'cancelled',
-      message: 'User cancelled cleanup.'
-    }))
-    addHistory(entry)
-    return { cancelled: true, outcomes: entry.outcomes }
-  }
   if (Date.now() >= plan.expiresAt)
     throw new Error('This cleanup plan expired. Scan and review again.')
 
-  for (const snapshot of plan.files) {
-    if (Date.now() >= plan.expiresAt) {
-      entry.outcomes.push({
-        path: snapshot.path,
-        app: snapshot.candidate.app,
-        sizeBytes: snapshot.size,
-        status: 'failed',
-        message: 'The cleanup plan expired before this file could be moved.'
-      })
-      continue
-    }
-
-    try {
-      await validateScannedFile(snapshot)
-      await rejectWindowsReparsePoints(getPathAncestors(snapshot.path))
-      await validateScannedFile(snapshot)
-      await shell.trashItem(snapshot.path)
-      entry.outcomes.push({
-        path: snapshot.path,
-        app: snapshot.candidate.app,
-        sizeBytes: snapshot.size,
-        status: 'moved',
-        message: 'Moved to the Recycle Bin.'
-      })
-    } catch (error) {
-      entry.outcomes.push({
-        path: snapshot.path,
-        app: snapshot.candidate.app,
-        sizeBytes: snapshot.size,
-        status: 'failed',
-        message: error instanceof Error ? error.message : 'Cleanup failed.'
-      })
-    }
-  }
-  addHistory(entry)
-  return { cancelled: false, outcomes: entry.outcomes }
+  const parent = BrowserWindow.fromWebContents(event.sender)
+  const result = await confirmAndTrashFiles(parent, plan.files, plan.expiresAt)
+  addHistory({
+    id: plan.id,
+    completedAt: new Date().toISOString(),
+    outcomes: result.outcomes
+  })
+  return result
 })
 
 ipcMain.handle('app:get-cleanup-history', () => cleanupHistory)
+
+ipcMain.handle('app:run-local-tool', async (event, input: unknown): Promise<LocalToolResult> => {
+  const request = validateToolRequest(input)
+  toolRequestLedger.claim(request.requestId)
+
+  const controller = new AbortController()
+  activeToolRequests.set(request.requestId, controller)
+  try {
+    const tool = TOOL_REGISTRY[request.toolName]
+    const parent = BrowserWindow.fromWebContents(event.sender)
+    let detail = `${tool.permissionMessage}\n\n${tool.description}`
+
+    if (request.toolName === 'delete_candidates') {
+      const { candidateIds } = request.arguments as { candidateIds: string[] }
+      const files: ScannedFileSnapshot[] = []
+      for (const id of candidateIds) {
+        const snapshot = getScannedFile(id)
+        if (!snapshot) {
+          return {
+            requestId: request.requestId,
+            toolName: request.toolName,
+            approved: false,
+            success: false,
+            error: {
+              code: 'INVALID_REQUEST',
+              message:
+                'A selected file is not in the latest scan. Run scan_computer again before deleting.'
+            }
+          }
+        }
+        files.push(snapshot)
+      }
+      detail = `${detail}\n\n${describeCleanupFiles(files)}`
+    }
+
+    const options: MessageBoxOptions = {
+      type: 'question',
+      buttons: ['Deny', 'Allow once'],
+      defaultId: 0,
+      cancelId: 0,
+      title: 'Local assistant action',
+      message: tool.title,
+      detail
+    }
+    const confirmation = parent
+      ? await dialog.showMessageBox(parent, options)
+      : await dialog.showMessageBox(options)
+
+    if (controller.signal.aborted) {
+      return {
+        requestId: request.requestId,
+        toolName: request.toolName,
+        approved: false,
+        success: false,
+        error: { code: 'CANCELLED', message: 'The request was cancelled.' }
+      }
+    }
+    if (confirmation.response !== 1) {
+      return {
+        requestId: request.requestId,
+        toolName: request.toolName,
+        approved: false,
+        success: false,
+        error: { code: 'USER_DENIED', message: 'You denied this local action.' }
+      }
+    }
+
+    if (request.toolName === 'delete_candidates') {
+      try {
+        const { candidateIds } = request.arguments as { candidateIds: string[] }
+        const files: ScannedFileSnapshot[] = []
+        for (const id of candidateIds) {
+          const snapshot = getScannedFile(id)
+          if (!snapshot) {
+            throw new Error('A selected file is not in the latest scan. Run scan_computer again before deleting.')
+          }
+          await validateScannedFile(snapshot)
+          files.push(snapshot)
+        }
+        const outcome = await confirmAndTrashFiles(parent, files, undefined, controller.signal)
+        addHistory({
+          id: request.requestId,
+          completedAt: new Date().toISOString(),
+          outcomes: outcome.outcomes
+        })
+        return {
+          requestId: request.requestId,
+          toolName: request.toolName,
+          approved: true,
+          success: true,
+          result: outcome
+        }
+      } catch (error) {
+        if (controller.signal.aborted) {
+          return {
+            requestId: request.requestId,
+            toolName: request.toolName,
+            approved: false,
+            success: false,
+            error: { code: 'CANCELLED', message: 'The request was cancelled.' }
+          }
+        }
+        return {
+          requestId: request.requestId,
+          toolName: request.toolName,
+          approved: true,
+          success: false,
+          error: {
+            code: 'TOOL_FAILED',
+            message: error instanceof Error ? error.message.slice(0, 400) : 'The local tool failed.'
+          }
+        }
+      }
+    }
+
+    try {
+      const result = await executeRegisteredTool(
+        request,
+        {
+          getSystemInfo: async () => ({
+            appVersion: app.getVersion(),
+            platform: process.platform,
+            architecture: process.arch,
+            operatingSystem: process.getSystemVersion()
+          })
+        },
+        controller
+      )
+      const serialized = JSON.stringify(result)
+      if (!serialized || serialized.length > 250_000) {
+        throw new Error('Local tool result exceeded the allowed size.')
+      }
+      return {
+        requestId: request.requestId,
+        toolName: request.toolName,
+        approved: true,
+        success: true,
+        result: JSON.parse(serialized) as unknown
+      }
+    } catch (error) {
+      const timedOut = controller.signal.reason instanceof Error && controller.signal.reason.name === 'TimeoutError'
+      const cancelled = controller.signal.aborted && !timedOut
+      return {
+        requestId: request.requestId,
+        toolName: request.toolName,
+        approved: true,
+        success: false,
+        error: {
+          code: timedOut ? 'TIMEOUT' : cancelled ? 'CANCELLED' : 'TOOL_FAILED',
+          message:
+            error instanceof Error ? error.message.slice(0, 400) : 'The local tool failed.'
+        }
+      }
+    }
+  } finally {
+    activeToolRequests.delete(request.requestId)
+  }
+})
+
+ipcMain.handle('app:cancel-local-tool', (_event, requestId: unknown) => {
+  if (typeof requestId !== 'string') return false
+  const controller = activeToolRequests.get(requestId)
+  if (!controller) return false
+  const error = new Error('Local tool execution was cancelled.')
+  error.name = 'AbortError'
+  controller.abort(error)
+  return true
+})
 
 app.whenReady().then(() => {
   electronApp.setAppUserModelId('com.agentjunkcleaner')

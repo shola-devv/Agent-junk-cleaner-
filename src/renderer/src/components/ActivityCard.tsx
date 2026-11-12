@@ -1,14 +1,22 @@
 interface ActivityCardProps {
   title: string
   detail: string
-  status?: 'ready' | 'running' | 'complete'
+  status?: 'ready' | 'running' | 'complete' | 'cancelled' | 'failed'
 }
 
 function ActivityCard({ title, detail, status = 'ready' }: ActivityCardProps): React.JSX.Element {
   return (
     <div className={`activity-card activity-${status}`}>
       <span className="activity-mark" aria-hidden="true">
-        {status === 'complete' ? '✓' : status === 'running' ? '◌' : '◇'}
+        {status === 'complete'
+          ? '✓'
+          : status === 'running'
+            ? '◌'
+            : status === 'failed'
+              ? '!'
+              : status === 'cancelled'
+                ? '–'
+                : '◇'}
       </span>
       <div>
         <strong>{title}</strong>

@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
 import type { ScanProgress } from '../main/scanner'
+import type { LocalToolRequest, LocalToolResult } from '../shared/toolTypes'
 
 const api = {
   getSystemInfo: () => ipcRenderer.invoke('app:get-system-info'),
@@ -8,6 +9,10 @@ const api = {
   createCleanupPlan: (fileIds: string[]) => ipcRenderer.invoke('app:create-cleanup-plan', fileIds),
   executeCleanupPlan: (planId: string) => ipcRenderer.invoke('app:execute-cleanup-plan', planId),
   getCleanupHistory: () => ipcRenderer.invoke('app:get-cleanup-history'),
+  runLocalTool: (request: LocalToolRequest): Promise<LocalToolResult> =>
+    ipcRenderer.invoke('app:run-local-tool', request),
+  cancelLocalTool: (requestId: string): Promise<boolean> =>
+    ipcRenderer.invoke('app:cancel-local-tool', requestId),
   onScanProgress: (callback: (progress: ScanProgress) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, progress: ScanProgress): void =>
       callback(progress)
